@@ -1,0 +1,361 @@
+proc print data=lab.health;
+run;
+
+
+PROC CONTENTS DATA=lab.health VARNUM; RUN;
+
+/*You need to convert bmi to numeric before running PROC MEANS/*
+/* Step 1: Check variable types */
+PROC CONTENTS DATA=lab.health;
+RUN;
+/* Create a numeric version of bmi */
+DATA lab.health_clean;
+    SET lab.health;
+    /* If bmi is character, convert to numeric */
+    bmi_num = INPUT(bmi, BEST12.);
+RUN;
+
+/* Use the numeric bmi variable */
+PROC MEANS DATA=lab.health_clean N NMISS MEAN MEDIAN STD MIN MAX;
+    VAR age avg_glucose_level bmi_num;
+RUN;
+
+/* Numeric summary + missings */
+PROC MEANS DATA=lab.health N NMISS MEAN MEDIAN STD MIN MAX;
+    VAR age avg_glucose_level bmi;
+RUN;
+
+/* Frequency tables for categorical variables (include missing) */
+PROC FREQ DATA=work.strokes_raw;
+    TABLES gender ever_married work_type Residence_type smoking_status hypertension heart_disease stroke / MISSING;
+RUN;
+
+/* Univariate checks (skewness, outliers) */
+ODS GRAPHICS ON;
+PROC UNIVARIATE DATA=work.strokes_raw NORMAL;
+    VAR age avg_glucose_level bmi;
+    HISTOGRAM / NORMAL;
+    QQPLOT / NORMAL(MU=EST SIGMA=EST);
+RUN;
+ODS GRAPHICS OFF;
+
+/* Quick missing counts via SQL */
+PROC SQL;
+    SELECT
+      SUM(missing(age))   AS n_missing_age,
+      SUM(missing(bmi))   AS n_missing_bmi,
+      SUM(missing(avg_glucose_level)) AS n_missing_glucose
+    FROM work.strokes_raw;
+QUIT;
+ods graphics / reset width=800px height=500px;
+
+/* Distribution histograms */
+proc sgplot data=lab.health_fe2;
+    histogram age / nbins=20;
+    density age / type=kernel;
+    title "Age Distribution";
+run;
+
+proc sgplot data=lab.health_fe2;
+    histogram bmi_w / nbins=25;
+    density bmi_w / type=kernel;
+    title "BMI (winsorized) Distribution";
+run;
+
+proc sgplot data=lab.health_fe2;
+    histogram glucose_w / nbins=30;
+    density glucose_w / type=kernel;
+    title "Average Glucose (winsorized) Distribution";
+run;
+
+/* Boxplots grouped by stroke */
+proc sgplot data=lab.health_fe2;
+    vbox age / category=stroke;
+    title "Age by Stroke Status (0/1)";
+run;
+
+proc sgplot data=lab.health_fe2;
+    vbox bmi_w / category=stroke;
+    title "BMI (winsorized) by Stroke Status";
+run;
+
+/* Bar chart: stroke % by BMI category */
+proc sgplot data=lab.health_fe2;
+    vbar bmi_cat / group=stroke stat=percent groupdisplay=cluster;
+    title "Stroke % by BMI Category";
+run;
+
+/* Scatter with regression lines */
+proc sgplot data=lab.health_fe2;
+    scatter x=age y=avg_glucose_level / group=stroke;
+    reg x=age y=avg_glucose_level / group=stroke;
+    title "Age vs Avg Glucose (grouped by stroke)";
+run;
+
+/* Correlation of numeric features */
+proc corr data=lab.health_fe2 nosimple plots=matrix(histogram);
+    var age bmi_w glucose_w age_bmi_interaction;
+run;
+
+ods graphics off;
+
+
+ Distribution-stabilizing transform (log1p) for right-skewed variables
+   ---------------------------- */
+data lab.health_trans;
+    set lab.health_winsor;
+    log_bmi = log(1 + bmi_w);
+    log_glucose = log(1 + glucose_w);
+run;
+
+/* ----------------------------
+   6B. Standardize numeric variables (zero mean, unit SD)
+   ---------------------------- */
+proc standard data=lab.health_trans mean=0 std=1 out=lab.health_scaled;
+    var age bmi_w glucose_w log_bmi log_glucose;
+run;
+
+
+/* ----------------------------
+   5A. Compute p5 and p95 for numeric variables to winsorize
+   ---------------------------- */
+proc univariate data=lab.health_imp_group noprint;
+    var bmi_num avg_glucose_level;
+    output out=work._pctl_ pctlpre=p_ pctlpts=5 95;
+run;
+
+data lab.health_winsor;
+    if _n_=1 then set work._pctl_;
+    set lab.health_imp_group;
+    /* clamp values to 5th/95th percentiles */
+    if bmi_num < p_5 then bmi_w = p_5;
+    else if bmi_num > p_95 then bmi_w = p_95;
+    else bmi_w = bmi_num;
+
+    if avg_glucose_level < p_5 then glucose_w = p_5;
+    else if avg_glucose_level > p_95 then glucose_w = p_95;
+    else glucose_w = avg_glucose_level;
+run;
+
+
+
+/* ----------------------------
+   4A. Option 1: Global median imputation using PROC STDIZE (robust)
+   ---------------------------- */
+proc stdize data=lab.health_conv out=lab.health_imp_global reponly method=median;
+    var bmi_num;
+run;
+
+/* ----------------------------
+   4B. Option 2 (recommended): Group-wise median imputation by gender (keeps biological differences)
+   ---------------------------- */
+proc sort data=lab.health_conv; by gender; run;
+
+proc means data=lab.health_conv nway median noprint;
+    class gender;
+    var bmi_num;
+    output out=work.gender_bmi_median (drop=_TYPE_ _FREQ_) median=median_bmi;
+run;
+
+data lab.health_imp_group;
+    merge lab.health_conv (in=a) work.gender_bmi_median;
+    by gender;
+    if a;
+    if missing(bmi_num) then do;
+        if not missing(median_bmi) then bmi_num = median_bmi;
+        else bmi_num = .; /* if median missing (rare), remain missing */
+        bmi_imputed_flag = 1;
+    end;
+    else bmi_imputed_flag = 0;
+run;
+
+/* ----------------------------
+   4C. Optional advanced: Multiple Imputation (PROC MI) — for more rigorous inference
+   ---------------------------- */
+proc mi data=lab.health_conv out=work.mi_out nimpute=5 seed=2025;
+    class gender ever_married work_type Residence_type smoking_status;
+    var bmi_num age avg_glucose_level hypertension heart_disease;
+run;
+
+
+
+
+/* ----------------------------
+   3. Missing counts (considering token names)
+   ---------------------------- */
+proc sql;
+    create table work.missing_summary_before as
+    select
+        count(*) as n_total,
+        sum(case when bmi_missing=1 then 1 else 0 end) as bmi_missing_before,
+        sum(case when missing(avg_glucose_level) then 1 else 0 end) as glucose_missing_before,
+        sum(case when missing(age) then 1 else 0 end) as age_missing_before
+    from lab.health_conv;
+quit;
+
+proc print data=work.missing_summary_before; title "Missing counts BEFORE imputation"; run;
+
+
+/* ----------------------------
+   2A. If BMI is character: convert to numeric and flag non-numeric tokens
+   (Run this block when &bmi_type = 2)
+   ---------------------------- */
+
+DATA lab.health_conv;
+    SET lab.health;
+
+    /* Normalize textual forms */
+    bmi_raw = strip(bmi);
+    bmi_uc  = upcase(bmi_raw);
+
+    /* Common textual tokens treated as missing */
+    if bmi_uc in ('', 'NA', 'N/A', 'UNKNOWN', '?') then bmi_token_missing = 1;
+    else bmi_token_missing = 0;
+
+    /* Attempt safe numeric conversion; '??' suppresses repeated invalid warnings */
+    bmi_num = input(bmi_raw, ?? best12.);
+
+    /* If conversion failed but token is numeric-like with stray characters,
+       detect alpha characters and set to missing (we keep a diagnostic flag) */
+    has_alpha = anyalpha(bmi_raw);
+    if has_alpha then bmi_num = .;
+
+    /* Final missing indicator for BMI (true if token missing or conversion failed) */
+    bmi_missing = (bmi_token_missing = 1) OR missing(bmi_num);
+
+    KEEP id gender age hypertension heart_disease ever_married work_type Residence_type
+         avg_glucose_level bmi bmi_raw bmi_uc bmi_num bmi_missing bmi_token_missing has_alpha stroke;
+RUN;
+
+/* If BMI was already numeric, you can simply create working copy */
+%if &bmi_type = 1 %then %do;
+   data lab.health_conv;
+       set lab.health;
+       bmi_num = bmi;
+       bmi_missing = missing(bmi);
+   run;
+%end;
+
+
+/* Create final engineered dataset */
+data lab.health_fe_final;
+    set lab.health;
+
+    /* Keep original raw variables */
+    age_raw = age;
+    bmi_raw = bmi;
+    glucose_raw = avg_glucose_level;
+
+    /* =======================
+       1. Age Group Categories
+       ======================= */
+    length age_group $10;
+    if age_raw < 18 then age_group = 'Child';
+    else if 18 <= age_raw < 40 then age_group = 'Young';
+    else if 40 <= age_raw < 60 then age_group = 'Middle';
+    else if age_raw >= 60 then age_group = 'Senior';
+    else age_group = 'Unknown';
+
+    /* =======================
+       2. BMI Categories
+       ======================= */
+    length bmi_cat $12;
+    if bmi_raw < 18.5 then bmi_cat = 'Underweight';
+    else if 18.5 <= bmi_raw < 25 then bmi_cat = 'Normal';
+    else if 25 <= bmi_raw < 30 then bmi_cat = 'Overweight';
+    else if bmi_raw >= 30 then bmi_cat = 'Obese';
+    else bmi_cat = 'Unknown';
+
+    /* =======================
+       3. Glucose Categories
+       ======================= */
+    length glucose_cat $15;
+    if glucose_raw < 100 then glucose_cat = 'Normal';
+    else if 100 <= glucose_raw < 140 then glucose_cat = 'Prediabetes';
+    else if glucose_raw >= 140 then glucose_cat = 'Diabetes';
+    else glucose_cat = 'Unknown';
+
+    /* =======================
+       4. Standardization (Z-score)
+       ======================= */
+    /* Mean and StdDev should be pre-computed using PROC MEANS */
+    /* Example placeholders - replace with your dataset values */
+    age_mean = 43.23;  age_std = 22.61;
+    bmi_mean = 28.37;  bmi_std = 6.98;
+    glucose_mean = 106.14; glucose_std = 45.28;
+
+    age_scaled = (age_raw - age_mean) / age_std;
+    bmi_scaled = (bmi_raw - bmi_mean) / bmi_std;
+    glucose_scaled = (glucose_raw - glucose_mean) / glucose_std;
+
+    /* =======================
+       5. Interaction Term
+       ======================= */
+    age_bmi_interaction = age_scaled * bmi_scaled;
+
+    /* =======================
+       6. One-Hot Encoding
+       ======================= */
+    /* Residence_type */
+    if Residence_type = 'Urban' then do;
+        res_urban = 1; res_rural = 0;
+    end;
+    else if Residence_type = 'Rural' then do;
+        res_urban = 0; res_rural = 1;
+    end;
+
+    /* Work_type */
+    work_private = (work_type = 'Private');
+    work_self = (work_type = 'Self-employed');
+    work_govt = (work_type = 'Govt_job');
+    work_children = (work_type = 'children');
+    work_never = (work_type = 'Never_worked');
+
+    /* Smoking_status */
+    smoke_former = (smoking_status = 'formerly smoked');
+    smoke_never = (smoking_status = 'never smoked');
+    smoke_smokes = (smoking_status = 'smokes');
+    smoke_unknown = (smoking_status = 'Unknown');
+run;
+
+/* View final engineered dataset */
+proc print data=lab.health_fe_final (obs=20);
+run;
+
+
+
+/* Missing counts AFTER (post-imputation/winsorizing) */
+proc sql;
+    create table work.missing_summary_after as
+    select
+        count(*) as n_total,
+        sum(case when bmi_missing=1 then 1 else 0 end) as bmi_missing_after,
+        sum(case when missing(avg_glucose_level) then 1 else 0 end) as glucose_missing_after
+    from lab.health_fe2;
+quit;
+
+proc print data=work.missing_summary_after; title "Missing counts AFTER imputation"; run;
+
+/* New variable distributions for reporting */
+proc freq data=lab.health_fe2;
+    tables age_group bmi_cat glucose_cat smoking_status stroke any_comorbidity / nocum nocol;
+run;
+
+proc means data=lab.health_fe2 mean std median p25 p75;
+    var age bmi_w glucose_w;
+run;
+
+
+
+H1 — Age: mean age differs between stroke and non-stroke
+/* H1: T-test for age */
+ods output TTests=work.tt_age;
+proc ttest data=lab.health_fe2;
+    class stroke;
+    var age;
+run;
+
+proc print data=work.tt_age; title "T-test results for Age by Stroke"; run;
+
+
+Interpretation note: Report group means, mean difference, t-statistic, and p-value from work.tt_age.
